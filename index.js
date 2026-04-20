@@ -51,7 +51,7 @@ function extraerMensaje(body) {
     const fromMe = !!payload.fromMe;
     const telefonoRaw = fromMe ? (payload.to || payload.from || '') : (payload.from || '');
     const telefono = telefonoRaw.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '');
-    return { telefono, texto: payload.body || '', fromMe, telefonoRaw };
+    return { telefono, texto: payload.body || payload.caption || payload.extendedTextMessage?.text || '', fromMe, telefonoRaw };
   }
 
   return null;
@@ -265,7 +265,7 @@ async function pollMensajes() {
       if (ts <= (ultimoProcesado.get(chatId) || 0)) continue;
       ultimoProcesado.set(chatId, ts);
 
-      const texto = msg.body || '';
+      const texto = msg.body || msg.caption || '';
       if (!texto.trim()) continue;
 
       const telefono = chatId.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@lid', '');
