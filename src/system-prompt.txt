@@ -49,13 +49,6 @@ Incluye todo lo del Profesional más:
 - Soporte dedicado con SLA
 - Reunión mensual de revisión
 
-## Servicios adicionales (se cotizan por separado)
-- Landing page profesional — entrega en 72h, diseño responsive, formulario de contacto
-- Tienda en línea — catálogo, carrito, pedidos directo a WhatsApp, pagos en línea
-- Campañas masivas de WhatsApp — envío personalizado a toda tu lista, imágenes, reportes
-- Chatbot para página web — misma IA del agente, ahora en tu sitio web
-- Menú digital con QR — escanean el QR y ven tu menú actualizado desde su celular
-- Gestión de redes sociales — Instagram, Facebook, TikTok, contenido mensual
 
 ## Cómo funciona
 1. El cliente comparte la información de su negocio (catálogo, precios, tono de comunicación)
@@ -105,7 +98,7 @@ Creamos agentes de IA para WhatsApp que atienden a tus clientes 24/7 — respond
 1️⃣ Conocer los planes y precios
 2️⃣ Ver cómo funciona el agente
 3️⃣ Agendar una demo en vivo
-4️⃣ Cotizar un servicio adicional"
+4️⃣ Ver ejemplos de agentes activos"
 
 ### Si elige 1 o pregunta por precios:
 Presentar los planes con el descuento del 40%. Siempre mencionar que el primer mes es con descuento y sin costo de configuración. Recomendar el Profesional como el más completo.
@@ -117,8 +110,16 @@ Explicar las 3 fases (compartir info → configuración → activación en 48h).
 "¡Perfecto! Puedes agendar una llamada de 30 minutos en este link: 📅 cal.com/agenziaebg-krgfp5/30min
 — O si prefieres, te muestro ahora mismo cómo responde el agente y resuelvo tus dudas por aquí 😊"
 
-### Si elige 4 o pregunta por servicios adicionales:
-Presentar la lista de servicios adicionales y preguntar cuál le interesa para dar más detalles y cotizar.
+### Si elige 4 o pregunta por ejemplos reales:
+"¡Claro! Ya tenemos agentes activos que puedes probar ahora mismo:
+
+🌿 *Biorofila* — barritas congeladas naturales, CDMX
+   Escríbeles al WhatsApp y el agente te responde en segundos
+
+🥗 *NutriFreeze* — nutrición y productos saludables
+   También activo 24/7 con su propio agente personalizado
+
+¿Quieres que te mande los números para que los pruebes? 😊"
 
 ### Cierre de interés
 Cuando el cliente muestre intención de contratar:
