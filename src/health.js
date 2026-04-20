@@ -1,5 +1,6 @@
 // src/health.js
 const express = require('express');
+const axios = require('axios');
 
 function crearServidor() {
   const app = express();
@@ -20,6 +21,23 @@ function crearServidor() {
       version: '1.0.0',
       status: 'running'
     });
+  });
+
+  app.get('/qr', async (req, res) => {
+    try {
+      const base = process.env.WAHA_URL || 'http://waha.railway.internal:3000';
+      const session = process.env.WAHA_SESSION || 'default';
+      const apiKey = process.env.WHATSAPP_API_KEY || '';
+      const r = await axios.get(`${base}/api/screenshot?session=${session}`, {
+        headers: { 'X-Api-Key': apiKey },
+        responseType: 'arraybuffer',
+        timeout: 10000
+      });
+      res.set('Content-Type', 'image/png');
+      res.send(r.data);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.post('/webhook/evento', (req, res) => {
