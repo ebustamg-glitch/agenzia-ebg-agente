@@ -5,6 +5,25 @@ const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 const { iniciarServidor } = require('./src/health');
 
+// ── Validación de variables de entorno ────────────────────────────────────────
+const ENV_REQUIRED = ['ANTHROPIC_API_KEY', 'WHATSAPP_API_KEY'];
+const ENV_WARN = ['WHATSAPP_API_URL', 'WAHA_URL', 'OWNER_PHONE'];
+const missingRequired = ENV_REQUIRED.filter(k => !process.env[k]);
+const missingWarn = ENV_WARN.filter(k => !process.env[k]);
+if (missingRequired.length) {
+  console.error('[Config] ❌ Variables de entorno FALTANTES (críticas):', missingRequired.join(', '));
+  console.error('[Config] El agente NO funcionará sin estas variables.');
+}
+if (missingWarn.length) {
+  console.warn('[Config] ⚠️  Variables de entorno no configuradas:', missingWarn.join(', '));
+}
+console.log('[Config] WAHA_URL:', process.env.WAHA_URL || '(derivada de WHATSAPP_API_URL)');
+console.log('[Config] WHATSAPP_API_URL:', process.env.WHATSAPP_API_URL || '(no configurada)');
+console.log('[Config] WAHA_SESSION:', process.env.WAHA_SESSION || 'default');
+console.log('[Config] OWNER_PHONE:', process.env.OWNER_PHONE || '(no configurado)');
+console.log('[Config] ANTHROPIC_API_KEY:', process.env.ANTHROPIC_API_KEY ? '✓ configurada' : '❌ FALTA');
+console.log('[Config] WHATSAPP_API_KEY:', process.env.WHATSAPP_API_KEY ? '✓ configurada' : '❌ FALTA');
+
 // ── Lead scoring ──────────────────────────────────────────────────────────────
 function calcularScore(historial) {
   const texto = historial.map(m => (typeof m.content === 'string' ? m.content : '')).join(' ').toLowerCase();
@@ -84,9 +103,16 @@ async function enviarMensaje(telefono, texto) {
   } catch (err) {
     console.error(`[enviarMensaje] ERROR → ${telefono}:`, err.response?.data || err.message);
     if (telefono.includes('@lid')) {
-      const chatIdFallback = payload.chatId.replace('@lid', '@c.us');
-      payload.chatId = chatIdFallback;
-      await axios.post(url, payload, { headers, timeout: 10000 });
+      try {
+        const chatIdFallback = payload.chatId.replace('@lid', '@c.us');
+        payload.chatId = chatIdFallback;
+        await axios.post(url, payload, { headers, timeout: 10000 });
+        console.log(`[enviarMensaje] OK (fallback @c.us) → ${chatIdFallback}`);
+        const telefonoLimpio = chatIdFallback.replace('@c.us', '');
+        enviosRecientes.set(telefonoLimpio, Date.now());
+      } catch (err2) {
+        console.error(`[enviarMensaje] ERROR fallback:`, err2.response?.data || err2.message);
+      }
     }
   }
 }
@@ -179,8 +205,22 @@ app.post('/whatsapp/webhook', async (req, res) => {
   const chatId = telefonoRaw || `${telefono}@c.us`;
   telefonosRaw.set(telefono, chatId);
 
-  const evento_str = String(evento);
-  if (evento_str === 'message.any' && !fromMe) return;
+  // Deduplicación por ID de mensaje (evita doble proceso si WAHA envía 'message' Y 'message.any')
+  const msgId = req.body?.payload?.id?._serialized || req.body?.payload?.id || null;
+  if (msgId) {
+    if (mensajesWebhookProcesados.has(msgId)) return;
+    mensajesWebhookProcesados.add(msgId);
+    if (mensajesWebhookProcesados.size > 500) {
+      const first = mensajesWebhookProcesados.values().next().value;
+      mensajesWebhookProcesados.delete(first);
+    }
+  }
+
+  // Actualizar marca de tiempo para evitar que polling reprocese
+  const msgTs = req.body?.payload?.timestamp;
+  if (msgTs) ultimoProcesado.set(chatId, msgTs);
+
+  console.log(`[Webhook] evento=${evento} fromMe=${fromMe} tel=${telefono} texto="${texto?.substring(0, 40)}"`);
 
   if (fromMe) {
     const ultimoEnvioBot = enviosRecientes.get(telefono) || 0;
@@ -188,6 +228,8 @@ app.post('/whatsapp/webhook', async (req, res) => {
     if (!fueElBot) silenciar(telefono);
     return;
   }
+
+  if (!texto || !texto.trim()) return;
 
   try {
     const respuesta = await manejarMensaje(telefono, texto);
@@ -206,7 +248,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
   }
 });
 
-// ── Admin endpoints ───────────────────────────────────────────────────────────
+// ── Diagnóstico y admin ───────────────────────────────────────────────────────
 const ADMIN_KEY = process.env.ADMIN_KEY || 'agenzia-admin';
 
 app.post('/admin/unsilence/:telefono', (req, res) => {
@@ -227,8 +269,69 @@ app.get('/admin/silenciados', (req, res) => {
   res.json(lista);
 });
 
-// ── Polling fallback (WAHA webhook delivery broken en Railway internal network) ──
-const ultimoProcesado = new Map();
+app.get('/admin/diagnostico', async (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const base = process.env.WAHA_URL || (process.env.WHATSAPP_API_URL || '').replace('/api/sendText', '');
+  const session = process.env.WAHA_SESSION || 'default';
+  let wahaStatus = 'desconocido';
+  let wahaError = null;
+  try {
+    const r = await axios.get(`${base}/api/sessions/${session}`, {
+      headers: { 'X-Api-Key': process.env.WHATSAPP_API_KEY }, timeout: 8000
+    });
+    wahaStatus = r.data?.status || 'sin status';
+  } catch (e) {
+    wahaError = e.message;
+  }
+  res.json({
+    uptime: Math.floor(process.uptime()),
+    env: {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ? '✓' : '❌ FALTA',
+      WHATSAPP_API_KEY: process.env.WHATSAPP_API_KEY ? '✓' : '❌ FALTA',
+      WHATSAPP_API_URL: process.env.WHATSAPP_API_URL || '❌ FALTA',
+      WAHA_URL: base,
+      WAHA_SESSION: session,
+      OWNER_PHONE: process.env.OWNER_PHONE || '(no configurado)',
+    },
+    waha: { status: wahaStatus, error: wahaError },
+    estado: {
+      conversaciones_activas: historiales.size,
+      silenciados_activos: [...silenciados.values()].filter(t => t > Date.now()).length,
+      chats_en_polling: ultimoProcesado.size,
+      pollEnCurso,
+    }
+  });
+});
+
+app.post('/admin/test-send', async (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const { telefono, texto } = req.body || {};
+  if (!telefono || !texto) return res.status(400).json({ error: 'Requiere telefono y texto' });
+  try {
+    await enviarMensaje(`${telefono}@c.us`, texto);
+    res.json({ ok: true, telefono, texto });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/test-claude', async (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const r = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: 'Responde solo: OK' }]
+    });
+    res.json({ ok: true, respuesta: r.content[0]?.text });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Deduplicación de mensajes (compartida entre webhook y polling) ─────────────
+const ultimoProcesado = new Map();   // chatId → timestamp del último mensaje procesado
+const mensajesWebhookProcesados = new Set(); // IDs de mensajes ya procesados via webhook
 let pollEnCurso = false;
 
 async function pollMensajes() {
