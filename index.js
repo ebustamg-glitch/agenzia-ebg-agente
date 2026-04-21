@@ -1,4 +1,5 @@
 require('dotenv').config();
+require('events').EventEmitter.defaultMaxListeners = 50;
 
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
@@ -228,8 +229,11 @@ app.get('/admin/silenciados', (req, res) => {
 
 // ── Polling fallback (WAHA webhook delivery broken en Railway internal network) ──
 const ultimoProcesado = new Map();
+let pollEnCurso = false;
 
 async function pollMensajes() {
+  if (pollEnCurso) return;
+  pollEnCurso = true;
   try {
     const base = process.env.WAHA_URL || (process.env.WHATSAPP_API_URL || '').replace('/api/sendText', '');
     const apiKey = process.env.WHATSAPP_API_KEY;
@@ -294,6 +298,8 @@ async function pollMensajes() {
     }
   } catch (err) {
     console.error('[Polling] Error:', err.code || err.message);
+  } finally {
+    pollEnCurso = false;
   }
 }
 
