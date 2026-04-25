@@ -1,9 +1,16 @@
 require('dotenv').config();
-require('events').EventEmitter.defaultMaxListeners = 50;
 
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
+const http = require('http');
 const { iniciarServidor } = require('./src/health');
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] unhandledRejection:', reason);
+});
 
 // ── Validación de variables de entorno ────────────────────────────────────────
 const ENV_REQUIRED = ['ANTHROPIC_API_KEY', 'WHATSAPP_API_KEY'];
@@ -24,15 +31,8 @@ console.log('[Config] OWNER_PHONE:', process.env.OWNER_PHONE || '(no configurado
 console.log('[Config] ANTHROPIC_API_KEY:', process.env.ANTHROPIC_API_KEY ? '✓ configurada' : '❌ FALTA');
 console.log('[Config] WHATSAPP_API_KEY:', process.env.WHATSAPP_API_KEY ? '✓ configurada' : '❌ FALTA');
 
-// ── Lead scoring ──────────────────────────────────────────────────────────────
-function calcularScore(historial) {
-  const texto = historial.map(m => (typeof m.content === 'string' ? m.content : '')).join(' ').toLowerCase();
-  const caliente = ['precio', 'contratar', 'quiero', 'plan', 'cuanto', 'pagar', 'empezar'];
-  const tibio = ['como funciona', 'info', 'que es', 'demo'];
-  if (caliente.some(kw => texto.includes(kw))) return 'caliente';
-  if (tibio.some(kw => texto.includes(kw))) return 'tibio';
-  return 'frio';
-}
+// keepAlive:false — evita que ECONNABORTED acumule error listeners en sockets reutilizados
+const wahaHttpAgent = new http.Agent({ keepAlive: false });
 
 const OWNER_PHONE = process.env.OWNER_PHONE || '5644145407';
 const OWNER_CHAT_ID = `${OWNER_PHONE}@c.us`;
@@ -42,14 +42,26 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SYSTEM_PROMPT = require('fs').readFileSync(require('path').join(__dirname, 'src', 'system-prompt.txt'), 'utf8');
 
 const historiales = new Map();
-const silenciados = new Map();       // telefono → timestamp hasta cuando está silenciado
-const ultimoMensaje = new Map();     // telefono → timestamp del último mensaje del cliente
+const silenciados = new Map();
+const ultimoMensaje = new Map();
 const reactivacionesEnviadas = new Map();
-const telefonosRaw = new Map();      // telefono limpio → chatId original
-const enviosRecientes = new Map();   // telefono → timestamp del último mensaje enviado por el bot
+const telefonosRaw = new Map();
+const enviosRecientes = new Map();
+const ultimoProcesado = new Map();
+const mensajesWebhookProcesados = new Set();
 
 const MAX_HISTORIAL = 20;
 const HORAS_SILENCIO = 24;
+
+// ── Lead scoring ──────────────────────────────────────────────────────────────
+function calcularScore(historial) {
+  const texto = historial.map(m => (typeof m.content === 'string' ? m.content : '')).join(' ').toLowerCase();
+  const caliente = ['precio', 'contratar', 'quiero', 'plan', 'cuanto', 'pagar', 'empezar'];
+  const tibio = ['como funciona', 'info', 'que es', 'demo'];
+  if (caliente.some(kw => texto.includes(kw))) return 'caliente';
+  if (tibio.some(kw => texto.includes(kw))) return 'tibio';
+  return 'frio';
+}
 
 function obtenerHistorial(telefono) {
   if (!historiales.has(telefono)) historiales.set(telefono, []);
@@ -188,6 +200,37 @@ async function manejarMensaje(telefono, texto) {
   return respuestaLimpia;
 }
 
+// ── Purge horario de todos los Maps ──────────────────────────────────────────
+setInterval(() => {
+  const ahora = Date.now();
+  const limite = ahora - 7 * 24 * 60 * 60 * 1000; // 7 días
+
+  for (const [k, ts] of ultimoMensaje.entries()) {
+    if (ts < limite) {
+      ultimoMensaje.delete(k);
+      historiales.delete(k);
+      telefonosRaw.delete(k);
+      reactivacionesEnviadas.delete(k);
+      enviosRecientes.delete(k);
+    }
+  }
+
+  for (const [k, hasta] of silenciados.entries()) {
+    if (hasta < ahora) silenciados.delete(k);
+  }
+
+  // ultimoProcesado: timestamps en segundos Unix
+  const limiteUnix = Math.floor(limite / 1000);
+  for (const [k, ts] of ultimoProcesado.entries()) {
+    if (ts < limiteUnix) ultimoProcesado.delete(k);
+  }
+
+  // mensajesWebhookProcesados: purge completo cada 7 días (son IDs efímeros)
+  if (mensajesWebhookProcesados.size > 1000) mensajesWebhookProcesados.clear();
+
+  console.log(`[Purge] Maps: historiales=${historiales.size} silenciados=${silenciados.size} ultimoProcesado=${ultimoProcesado.size} webhookDedup=${mensajesWebhookProcesados.size}`);
+}, 60 * 60 * 1000);
+
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = iniciarServidor();
 
@@ -205,7 +248,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
   const chatId = telefonoRaw || `${telefono}@c.us`;
   telefonosRaw.set(telefono, chatId);
 
-  // Deduplicación por ID de mensaje (evita doble proceso si WAHA envía 'message' Y 'message.any')
+  // Deduplicación — evita doble proceso si WAHA envía 'message' Y 'message.any'
   const msgId = req.body?.payload?.id?._serialized || req.body?.payload?.id || null;
   if (msgId) {
     if (mensajesWebhookProcesados.has(msgId)) return;
@@ -216,7 +259,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
     }
   }
 
-  // Actualizar marca de tiempo para evitar que polling reprocese
+  // Actualizar marca de tiempo para que polling no reprocese este mensaje
   const msgTs = req.body?.payload?.timestamp;
   if (msgTs) ultimoProcesado.set(chatId, msgTs);
 
@@ -248,7 +291,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
   }
 });
 
-// ── Diagnóstico y admin ───────────────────────────────────────────────────────
+// ── Admin endpoints ───────────────────────────────────────────────────────────
 const ADMIN_KEY = process.env.ADMIN_KEY || 'agenzia-admin';
 
 app.post('/admin/unsilence/:telefono', (req, res) => {
@@ -277,7 +320,9 @@ app.get('/admin/diagnostico', async (req, res) => {
   let wahaError = null;
   try {
     const r = await axios.get(`${base}/api/sessions/${session}`, {
-      headers: { 'X-Api-Key': process.env.WHATSAPP_API_KEY }, timeout: 8000
+      headers: { 'X-Api-Key': process.env.WHATSAPP_API_KEY },
+      httpAgent: wahaHttpAgent,
+      timeout: 8000
     });
     wahaStatus = r.data?.status || 'sin status';
   } catch (e) {
@@ -292,13 +337,14 @@ app.get('/admin/diagnostico', async (req, res) => {
       WAHA_URL: base,
       WAHA_SESSION: session,
       OWNER_PHONE: process.env.OWNER_PHONE || '(no configurado)',
+      CLAUDE_MODEL: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001 (default)',
     },
     waha: { status: wahaStatus, error: wahaError },
     estado: {
       conversaciones_activas: historiales.size,
       silenciados_activos: [...silenciados.values()].filter(t => t > Date.now()).length,
       chats_en_polling: ultimoProcesado.size,
-      pollEnCurso,
+      webhook_dedup_size: mensajesWebhookProcesados.size,
     }
   });
 });
@@ -329,30 +375,22 @@ app.post('/admin/test-claude', async (req, res) => {
   }
 });
 
-// ── Deduplicación de mensajes (compartida entre webhook y polling) ─────────────
-const ultimoProcesado = new Map();   // chatId → timestamp del último mensaje procesado
-const mensajesWebhookProcesados = new Set(); // IDs de mensajes ya procesados via webhook
-let pollEnCurso = false;
-
+// ── Polling fallback ──────────────────────────────────────────────────────────
 async function pollMensajes() {
-  if (pollEnCurso) return;
-  pollEnCurso = true;
-  try {
-    const base = process.env.WAHA_URL || (process.env.WHATSAPP_API_URL || '').replace('/api/sendText', '');
-    const apiKey = process.env.WHATSAPP_API_KEY;
-    const session = process.env.WAHA_SESSION || 'default';
+  const base = process.env.WAHA_URL || (process.env.WHATSAPP_API_URL || '').replace('/api/sendText', '');
+  const apiKey = process.env.WHATSAPP_API_KEY;
+  const session = process.env.WAHA_SESSION || 'default';
+  const reqOpts = { headers: { 'X-Api-Key': apiKey }, httpAgent: wahaHttpAgent, timeout: 5000 };
 
-    const statusRes = await axios.get(`${base}/api/sessions/${session}`, {
-      headers: { 'X-Api-Key': apiKey }, timeout: 15000
-    });
+  try {
+    // Session check PRIMERO — si WAHA no está listo, no hacer nada más
+    const statusRes = await axios.get(`${base}/api/sessions/${session}`, reqOpts);
     if (statusRes.data?.status !== 'WORKING') {
       console.log(`[Polling] Sesión ${session} no está WORKING (${statusRes.data?.status}) — omitiendo`);
       return;
     }
 
-    const chatsRes = await axios.get(`${base}/api/${session}/chats?limit=30`, {
-      headers: { 'X-Api-Key': apiKey }, timeout: 15000
-    });
+    const chatsRes = await axios.get(`${base}/api/${session}/chats?limit=30`, reqOpts);
     const chats = chatsRes.data || [];
 
     for (const chat of chats) {
@@ -361,7 +399,7 @@ async function pollMensajes() {
 
       const msgsRes = await axios.get(
         `${base}/api/${session}/chats/${encodeURIComponent(chatId)}/messages?limit=1&downloadMedia=false`,
-        { headers: { 'X-Api-Key': apiKey }, timeout: 15000 }
+        reqOpts
       );
       const msgs = msgsRes.data || [];
       if (!msgs.length) continue;
@@ -372,7 +410,7 @@ async function pollMensajes() {
       if (ts <= (ultimoProcesado.get(chatId) || 0)) continue;
       ultimoProcesado.set(chatId, ts);
 
-      const texto = msg.body || msg.caption || '';
+      const texto = msg.body || msg.caption || msg.extendedTextMessage?.text || '';
       if (!texto.trim()) continue;
 
       const telefono = chatId.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@lid', '');
@@ -400,21 +438,19 @@ async function pollMensajes() {
       ]);
     }
   } catch (err) {
-    console.error('[Polling] Error:', err.code || err.message);
-  } finally {
-    pollEnCurso = false;
+    console.error('[Polling] Error:', err.code || err.message, err.response?.status, err.response?.data);
   }
 }
 
 async function inicializarPolling() {
   const base = process.env.WAHA_URL || (process.env.WHATSAPP_API_URL || '').replace('/api/sendText', '');
+  const apiKey = process.env.WHATSAPP_API_KEY;
+  const session = process.env.WAHA_SESSION || 'default';
+  const reqOpts = { headers: { 'X-Api-Key': apiKey }, httpAgent: wahaHttpAgent, timeout: 5000 };
+
   console.log('[Polling] Base URL:', base);
   try {
-    const apiKey = process.env.WHATSAPP_API_KEY;
-    const session = process.env.WAHA_SESSION || 'default';
-    const chatsRes = await axios.get(`${base}/api/${session}/chats?limit=30`, {
-      headers: { 'X-Api-Key': apiKey }, timeout: 15000
-    });
+    const chatsRes = await axios.get(`${base}/api/${session}/chats?limit=30`, reqOpts);
     const chats = chatsRes.data || [];
     for (const chat of chats) {
       const chatId = chat.id?._serialized || chat.id;
@@ -422,7 +458,7 @@ async function inicializarPolling() {
       try {
         const msgsRes = await axios.get(
           `${base}/api/${session}/chats/${encodeURIComponent(chatId)}/messages?limit=1&downloadMedia=false`,
-          { headers: { 'X-Api-Key': apiKey }, timeout: 15000 }
+          reqOpts
         );
         const msgs = msgsRes.data || [];
         if (msgs.length) ultimoProcesado.set(chatId, msgs[0].timestamp || 0);
@@ -432,7 +468,12 @@ async function inicializarPolling() {
   } catch (err) {
     console.error('[Polling] Error en inicialización:', err.code || err.message);
   }
-  setInterval(pollMensajes, 3000);
+
+  // while(true) garantiza un solo ciclo a la vez — nunca se solapan
+  while (true) {
+    await pollMensajes();
+    await new Promise(r => setTimeout(r, 10000));
+  }
 }
 
 inicializarPolling();
